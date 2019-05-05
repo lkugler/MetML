@@ -1,39 +1,19 @@
 #!/home/srvx11/lehre/users/a1254888/.conda/envs/a1254888/bin/python
 # -*- coding: utf-8 -*-
 """
-
 Author(s)
 ---------
 Lukas Kugler (a1254888@univie.ac.at)
 
 """
-
-################################################################################
-# MODULES
-################################################################################
-# Initialize timer for timing statistics.
 from __future__ import division
 import sys
 import os
 from shutil import copy
-from icepy.utils import utils
-timer = utils.TimerAdv(name=os.path.basename(sys.argv[0]))
-
-# Import standard modules.
-timer.start('module_imports')
-import os
-import sys
 import datetime as dt
 import numpy as np
 import json, warnings
 import pandas as pd
-timer.stop('module_imports')
-
-# Import user modules.
-timer.start('icepy_module_imports')
-from icepy.utils import hdf5
-from icepy.utils import utils
-timer.stop('icepy_module_imports')
 
 class Dataset(object):
     """This class handles the datasets.
@@ -80,7 +60,6 @@ class Dataset(object):
 
         6) join observations according to each row's 'valid_time'
 
-    Note: index is never time ?!
     """
     def __init__(self, dataframes_obs, dataframes_fcst,
                  lagged_ensemble=False,
@@ -124,7 +103,7 @@ class Dataset(object):
         self.obs_datasets = obs_dfs.keys()
         self.fcst_datasets = fcst_dfs.keys()
 
-        obs = self.prepare_obs(obs_dfs)
+        obs = self.prepare_obs(obs_dfs, steps_back=steps_back)
         fcsts = self.prepare_fcsts(fcst_dfs, steps_back=steps_back,
                                              lagged_ensemble=lagged_ensemble,
                                              minmax_leadtime=minmax_leadtime,)
@@ -180,7 +159,14 @@ class Dataset(object):
 
         return df.loc[mask,:]
 
-    def prepare_obs(self, obs_dfs):
+    def prepare_obs(self, obs_dfs, steps_back=0):
+        """
+        obs_dfs : dict
+            dict of (ds_name, pd.DataFrame) pairs
+            df.index has to be datetime when the observation is valid
+
+            Currently: len(obs_dfs.keys()) allowed is at most 1
+        """
         if len(obs_dfs.keys()) > 1:
             raise NotImplementedError('This module currently only supports one data-'
                   'frame of observations: len(obs_dfs.keys()) > 1')
@@ -189,29 +175,30 @@ class Dataset(object):
         used_obs_df = obs_dfs.keys()[0]
         obs = obs_dfs[used_obs_df]
         obs['timeofday'] = obs.index.hour  # additional predictor probably
+
+        if steps_back > 0:
+            for parameter in obs.keys():
+                if parameter in ('valid_time', 'init', 'fxh'):
+                    continue
+                # shift every predictor
+                for i in range(1, steps_back+1):
+                    # shift by all hours between 1 and steps_back
+                    obs = self.add_shifted_predictor_onelevel(obs, parameter, shift_hours=i)
+
         # add hierarchical column
         keys = [('obs', 0, param) for param in obs.columns]
         obs.columns = pd.MultiIndex.from_tuples(keys, names=self.names)
         self.obs_keys = obs.keys()  # for use outside this module
+
+
         return obs
 
     def prepare_fcsts(self, fcst_dfs,
                       lagged_ensemble=None, steps_back=None,
                       minmax_leadtime=(None, None)):
         """
-        Parameters
-        ----------
-        obs_dfs : dict
-            dict of (ds_name, pd.DataFrame) pairs
-            df.index has to be datetime when the observation is valid
-
-            Currently: len(obs_dfs.keys()) < 2
-
         fcst_dfs : dict
             dict of (ds_name, pd.DataFrame) pairs
-
-        level_names : list
-
         """
 
         # check input: `valid` is a mandatory field!
@@ -224,15 +211,26 @@ class Dataset(object):
         # add hierarchical columns for each dataset
         list_fcst_dfs = [df for name, df in fcst_dfs.iteritems()]
         ds_names = [name for name, df in fcst_dfs.iteritems()]
+
+        # create index for merging, that contains valid time and forecast hour
         for df in list_fcst_dfs:
-            df.set_index('valid', inplace=True)
+            df['mergeindex'] = df['valid'].map(str) + '-' + df['fxh'].map(str)
+            df.set_index('mergeindex', inplace=True)
+
+        # glue all forecasts together, with inner join on index=(valid & fxh)
         df_fcst = pd.concat(list_fcst_dfs, axis=1, join='inner', keys=ds_names)
+
+        # replace mergeindex with valid time again
+        some_dataset = df_fcst.keys().levels[0][0]
+        df_fcst.set_index((some_dataset, 'valid'), inplace=True)
+        df_fcst.index.name = 'valid'
         df_fcst.columns.names = [self.names[0], self.names[2]]
+        print df_fcst.keys()
 
         # for use outside this module
         self.fcst_keys = [a for a in df_fcst.keys() if a not in self.obs_keys]
 
-        def _ignore_spinup(df_fcst, hours_ignore=1):
+        def _ignore_spinup(df_fcst, hours_ignore=0):
             """Drop all rows with fxh less or equal to `hours_ignore`."""
             mask = np.ones(len(df_fcst), dtype=bool)
             for dataset in df_fcst.keys().levels[0]:
@@ -297,7 +295,7 @@ class Dataset(object):
         if self.lagged_ensemble:
             # self.df.columns-index is tuple, convert it to MultiIndex again.
             tuples = list(df_fcst.columns)
-            df_fcst.columns = pd.MultiIndex.from_tuples(tuples, names=names)
+            df_fcst.columns = pd.MultiIndex.from_tuples(tuples, names=self.names)
 
         def check_validity(df):
             """Random sample test the validity of the join operations.
@@ -410,10 +408,6 @@ class Dataset(object):
 
         dataset, param = orig_key
         new_key = (dataset, param+'-'+str(shift_hours))
-        #print new_key
-
-        # if (0, 'valid_time') not in df.keys():
-        #     df[(0, 'valid_time')] = df.index
 
         shifted_time = df[(0, 'valid_time')] + dt.timedelta(hours=shift_hours)
         fxh = df[(dataset, 'fxh')].values+shift_hours
@@ -422,14 +416,42 @@ class Dataset(object):
                                         (dataset, 'fxh'): fxh,
                                         (0, 'valid_time'): shifted_time})
 
-        #a = df.iloc[100:110]
-        print len(df)
         df = pd.merge(df, fcst_shift, how='left',
                       on=[(0, 'valid_time'), (dataset, 'fxh')])
 
         df.index = df[(0, 'valid_time')]
-        print len(df)
-        # print df.iloc[100:110]
-        #  #df.drop(labels=[(0, 'valid_time'),], axis=1, inplace=True)
-        # raw_input('.')
+        return df
+
+    @staticmethod
+    def add_shifted_predictor_onelevel(df, orig_key, shift_hours=1):
+        """Add the predicted value of a parameter ´shift_hours´ hours ago
+        as a new parameter/predictor.
+
+        join on: same
+
+        Parameters
+        ----------
+            orig_fcst : pd.DataFrame
+                Dataframe before adding shifted parameters
+
+            orig_key : tuple or str
+                key of parameter to shift
+
+
+        We do this by shifting the valid time by one hour,
+        and merging the df with the original dataframe with matching
+        valid and init time.
+        """
+        assert isinstance(shift_hours, int)
+        assert shift_hours != 0
+
+        param = orig_key
+        new_key = param+'-'+str(shift_hours)
+
+        shifted_time = df.index + dt.timedelta(hours=shift_hours)
+
+        fcst_shift = pd.DataFrame(index=shifted_time,
+                                  data={new_key: df[orig_key].values})
+
+        df = df.join(fcst_shift, how='left')
         return df
